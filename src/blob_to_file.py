@@ -3,7 +3,7 @@
 Export LONGBLOB data from a MySQL table to physical files.
 
 Requirements:
-    pip install pymysql python-dotenv
+    pip install -r requirements.txt
 
 Database credentials are read from a .env file (or the environment):
     MYSQL_HOST=localhost
@@ -14,13 +14,22 @@ Database credentials are read from a .env file (or the environment):
 Command-line options (--host, --user, ...) override the .env values.
 The password is always prompted for interactively.
 
-Examples:
-    # Export a single row (id = 42) to an explicit file path
-    python blob_to_file.py --table documents --blob-col content \
-        --id-col id --id 42 --output ./out/report.pdf
+Any required value that is still missing (user, database, table, blob column)
+is prompted for. When that happens the script runs as a wizard and also asks
+for the optional values that were not given (Enter keeps the default shown);
+otherwise optional values silently fall back to their defaults.
+
+Examples (run from the project root: .env and ./output are resolved against
+the current directory):
+    # Fully interactive: prompts for everything not in .env
+    python src/blob_to_file.py
+
+    # Export a single row (id = 42) to ./output/report.pdf
+    python src/blob_to_file.py --table documents --blob-col content \
+        --id-col id --id 42 --output report.pdf
 
     # Export every row to a folder, naming each file from a column
-    python blob_to_file.py --table documents --blob-col content \
+    python src/blob_to_file.py --table documents --blob-col content \
         --id-col id --name-col file_name --output-dir ./export
 """
 
@@ -29,6 +38,7 @@ import getpass
 import os
 import re
 import sys
+from collections.abc import Callable
 from pathlib import Path
 
 import pymysql
@@ -42,6 +52,30 @@ def quote_ident(name: str) -> str:
     if not IDENTIFIER_RE.match(name):
         raise ValueError(f"Invalid SQL identifier: {name!r}")
     return f"`{name}`"
+
+
+def ask(label: str, default: str | None = None, required: bool = False,
+        validate: Callable[[str], object] | None = None) -> str | None:
+    """Prompt for a value; Enter keeps the default (or skips an optional value)."""
+    hint = f" [{default}]" if default is not None else ""
+    while True:
+        value = input(f"{label}{hint}: ").strip()
+        if not value:
+            if required and default is None:
+                print(f"{label} is required.", file=sys.stderr)
+                continue
+            return default
+        if validate:
+            try:
+                validate(value)
+            except ValueError as e:
+                print(e, file=sys.stderr)
+                continue
+        return value
+
+
+def confirm(label: str) -> bool:
+    return input(f"{label} [y/N]: ").strip().lower() in ("y", "yes")
 
 
 def safe_filename(name: str) -> str:
@@ -74,41 +108,65 @@ def main() -> int:
     p.add_argument("--port", type=int, help="Overrides MYSQL_PORT (default 3306)")
     p.add_argument("--user", help="Overrides MYSQL_USER")
     p.add_argument("--database", help="Overrides MYSQL_DATABASE")
-    p.add_argument("--table", required=True)
-    p.add_argument("--blob-col", required=True, help="LONGBLOB column")
-    p.add_argument("--id-col", default="id", help="Primary key column")
+    p.add_argument("--table")
+    p.add_argument("--blob-col", help="LONGBLOB column")
+    p.add_argument("--id-col", help="Primary key column (default id)")
     p.add_argument("--id", help="Export only the row with this id")
     p.add_argument("--name-col", help="Column holding the original file name")
-    p.add_argument("--ext", default=".bin", help="Extension when no name column (default .bin)")
+    p.add_argument("--ext", help="Extension when no name column (default .bin)")
     p.add_argument("--output", help="Output file name or path, relative to --output-dir (single row with --id)")
-    p.add_argument("--output-dir", default=DEFAULT_OUTPUT_DIR, help=f"Folder for exported files (default {DEFAULT_OUTPUT_DIR})")
-    p.add_argument("--overwrite", action="store_true", help="Overwrite existing files")
+    p.add_argument("--output-dir", help=f"Folder for exported files (default {DEFAULT_OUTPUT_DIR})")
+    p.add_argument("--overwrite", action=argparse.BooleanOptionalAction, help="Overwrite existing files")
     args = p.parse_args()
 
     if args.output and args.id is None:
         p.error("--output requires --id")
 
-    # Existing environment variables take precedence over the .env file
+    # Precedence: command line > environment > .env file > interactive prompt
     load_dotenv(args.env_file)
-    host = args.host or os.environ.get("MYSQL_HOST", "localhost")
-    port = args.port or int(os.environ.get("MYSQL_PORT", "3306"))
+    host = args.host or os.environ.get("MYSQL_HOST")
+    port = args.port or os.environ.get("MYSQL_PORT")
     user = args.user or os.environ.get("MYSQL_USER")
     database = args.database or os.environ.get("MYSQL_DATABASE")
-    if not user:
-        p.error("database user not set (MYSQL_USER in .env or --user)")
-    if not database:
-        p.error("database name not set (MYSQL_DATABASE in .env or --database)")
 
+    # Something required is missing, so the user gets asked for optional values too
+    wizard = not all((user, database, args.table, args.blob_col))
+
+    def optional(value, label, default=None, validate=None):
+        if value is not None:
+            return value
+        return ask(label, default, validate=validate) if wizard else default
+
+    host = optional(host, "Host", "localhost")
+    port = int(optional(port, "Port", "3306", validate=int))
+    user = user or ask("Database user", required=True)
+    database = database or ask("Database name", required=True)
     password = getpass.getpass("Database password: ")
 
-    cols = [quote_ident(args.id_col), quote_ident(args.blob_col)]
-    if args.name_col:
-        cols.append(quote_ident(args.name_col))
-    sql = f"SELECT {', '.join(cols)} FROM {quote_ident(args.table)}"
+    table = args.table or ask("Table", required=True, validate=quote_ident)
+    blob_col = args.blob_col or ask("Blob column", required=True, validate=quote_ident)
+    id_col = optional(args.id_col, "Id column", "id", validate=quote_ident)
+    row_filter = optional(args.id, "Row id (empty = all rows)")
+    output = args.output
+    if output is None and row_filter is not None:
+        output = optional(None, "Output file (empty = name it from id/name column)")
+    # The naming options only matter when no explicit output file is given
+    name_col = args.name_col
+    ext = args.ext
+    if output is None:
+        name_col = optional(name_col, "File name column (optional)", validate=quote_ident)
+        ext = optional(ext, "Extension when no file name", ".bin")
+    output_dir = optional(args.output_dir, "Output folder", DEFAULT_OUTPUT_DIR)
+    overwrite = args.overwrite if args.overwrite is not None else (wizard and confirm("Overwrite existing files?"))
+
+    cols = [quote_ident(id_col), quote_ident(blob_col)]
+    if name_col:
+        cols.append(quote_ident(name_col))
+    sql = f"SELECT {', '.join(cols)} FROM {quote_ident(table)}"
     params = ()
-    if args.id is not None:
-        sql += f" WHERE {quote_ident(args.id_col)} = %s"
-        params = (args.id,)
+    if row_filter is not None:
+        sql += f" WHERE {quote_ident(id_col)} = %s"
+        params = (row_filter,)
 
     conn = pymysql.connect(
         host=host,
@@ -132,18 +190,16 @@ def main() -> int:
                     skipped += 1
                     continue
 
-                output_dir = Path(args.output_dir)
-
-                if args.output:
+                if output:
                     # A relative --output is placed inside --output-dir; an absolute one wins
-                    target = output_dir / args.output
-                elif args.name_col and row[2]:
-                    target = output_dir / f"{row_id}_{safe_filename(row[2])}"
+                    target = Path(output_dir) / output
+                elif name_col and row[2]:
+                    target = Path(output_dir) / f"{row_id}_{safe_filename(row[2])}"
                 else:
-                    target = output_dir / f"{row_id}{args.ext}"
+                    target = Path(output_dir) / f"{row_id}{ext}"
 
                 try:
-                    write_bytes(target, bytes(blob), args.overwrite)
+                    write_bytes(target, bytes(blob), overwrite)
                     print(f"[ok]   id={row_id} -> {target} ({len(blob):,} bytes)")
                     exported += 1
                 except FileExistsError as e:
